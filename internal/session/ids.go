@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"regexp"
 	"strings"
 )
 
@@ -225,5 +226,74 @@ func TurnRequestID(turnKey string) string {
 		return NewMessageID()
 	}
 	sum := sha256.Sum256([]byte(deriveSalt + "|" + turnKey))
+	return hex.EncodeToString(sum[:16])
+}
+
+// CacheConversationKey 返回出站会话标识的最终兜底：显式会话 ID 优先，缺失时用
+// body 内容派生的稳定键（system + 首条 user，见 deriveKey）。
+//
+// 与 ExtractKey 的唯一差异是**不做 user 维度闸**（hasUserIDKey 抑制）：那道闸是
+// 「账号粘性」的粒度契约（user 维度太粗，会把同一 user 的全部并行对话钉到同一
+// 账号）；而会话标识 / 前缀缓存槽的诉求恰好相反——同一会话稳定复用、不同会话分开，
+// 粒度粗只会让多个会话塌进同一槽互相驱逐。
+//
+// 上游 WorkBuddy 5.7.6 起 /v2/chat/completions 把会话 ID 纳入渠道校验，缺失即
+// 503 + code 11128「conversation id missing」。只发 user_id 的客户端在
+// ResolveConversationID 与 ExtractKey 下恒得空串，故必须再退一层到这里，保证
+// 出站恒有会话标识（头 X-Conversation-ID 与 body conversation_id 同源）。
+//
+// 恒返回非空（body 连 messages 都没有时回落整包 sha256）。
+func CacheConversationKey(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if v := strOrEmpty(meta["conversation_id"]); v != "" {
+			return v
+		}
+		if v := strOrEmpty(meta["conversationId"]); v != "" {
+			return v
+		}
+	}
+	if v := strOrEmpty(obj["conversation_id"]); v != "" {
+		return v
+	}
+	if v := strOrEmpty(obj["conversationId"]); v != "" {
+		return v
+	}
+	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
+		return v
+	}
+	if k := deriveKey(obj); k != "" {
+		return k
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:16])
+}
+
+// conversationIDPattern 官方客户端对会话 ID 的合法形状约束。
+// 实测来源：官方桌面端云会话实现 CloudConversationsImpl 的建会话入口对调用方传入的
+// conversationId 做同一正则校验，不合法直接返回 errorCode「CONVERSATION_ID_INVALID」
+// / message「conversationId must be a non-empty stable identifier」。
+// 首字符必须是字母数字，其余最多 127 个 [A-Za-z0-9._:-]。
+var conversationIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+// SanitizeConversationID 把任意来源的会话标识整形为官方合法形状：已合法则原样返回
+// （零漂移），非法（含空格/斜杠/超长/非 ASCII 等）则退化为其 sha256 前 16 字节 hex
+// ——仍是稳定值，同一输入恒同输出，不会打散会话槽。
+//
+// 空串返回空串（由调用方决定是否再退一层）。
+func SanitizeConversationID(id string) string {
+	if id == "" {
+		return ""
+	}
+	if conversationIDPattern.MatchString(id) {
+		return id
+	}
+	sum := sha256.Sum256([]byte(id))
 	return hex.EncodeToString(sum[:16])
 }

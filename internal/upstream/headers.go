@@ -185,7 +185,7 @@ func (c *Client) injectCodeBuddyRequest(req *http.Request) {
 // 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
 type ChatMeta struct {
-	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
+	ConversationID        string // X-Conversation-ID：入站提取值，缺失由 handler 逐层兜底后整形，出站恒发
 	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
 	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
 }
@@ -256,8 +256,9 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 
 // injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
 // 头族分四层，各司其职：
-//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
-//     透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话。
+//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。恒发；客户端
+//     没给时由 handler 用会话键/内容派生键补齐并整形为官方合法形状（上游 5.7.6 起
+//     缺失即渠道校验失败 503 + code 11128）。
 //   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
 //     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）。
 //   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（32 位 hex）。
@@ -274,9 +275,17 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 		convReqID = session.NewMessageID()
 	}
 	messageID := session.NewMessageID()
-	if meta.ConversationID != "" {
-		req.Header.Set("X-Conversation-ID", meta.ConversationID)
+	// X-Conversation-ID 恒发（原「空则不发——不伪造」契约已作废）：官方客户端
+	// （CLI buildConversationHeaders 的 CONVERSATION_ID_HEADER、桌面端 Yr()）都是
+	// 无条件设置该头，而上游 WorkBuddy 5.7.6 起把它纳入渠道校验——缺失即
+	// 503 + code 11128 "conversation id missing"。handler 已保证 meta.ConversationID
+	// 非空（ResolveConversationID → 会话键 → CacheConversationKey）；零值 meta 的
+	// 直接调用方再退到本轮聚合主键，同轮内稳定，不引入每请求随机值打散会话槽。
+	convID := meta.ConversationID
+	if convID == "" {
+		convID = convReqID
 	}
+	req.Header.Set("X-Conversation-ID", convID)
 	req.Header.Set("X-Conversation-Request-ID", convReqID)
 	req.Header.Set("X-Conversation-Message-ID", messageID)
 	req.Header.Set("X-Request-ID", messageID)
@@ -334,6 +343,12 @@ func (c *Client) injectAttribution(req *http.Request) {
 		return
 	}
 	req.Header.Set("X-Agent-Purpose", "conversation")
+	// 官方客户端 chat 出站恒带这三头（CLI buildConversationHeaders 的 AGENT_INTENT /
+	// AGENT_TYPE，桌面端 Yr() 的 craft/main + X-Private-Data=true）。只发
+	// X-Agent-Purpose 时代理指纹不全，上游渠道校验会判为「非官方客户端」。
+	req.Header.Set("X-Agent-Intent", "craft")
+	req.Header.Set("X-Agent-Type", "main")
+	req.Header.Set("X-Private-Data", "true")
 	req.Header.Set("X-IDE-Name", name)
 	req.Header.Set("X-IDE-Type", name)
 	req.Header.Set("X-IDE-Version", c.clientVersion())

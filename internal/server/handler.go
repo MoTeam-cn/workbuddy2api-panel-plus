@@ -889,12 +889,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再
 	// 碎片化（此前网关一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个
 	// RequestID）。
-	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造）；
+	//   - conversationID：body 提取 → 粘性会话键 → 内容派生兜底，出站恒有值
+	//     （上游 5.7.6 起会话 ID 是渠道校验必需项，缺失 → 503 code 11128
+	//     "conversation id missing"；沿用「缺省空串——不伪造」会全池失败）；
 	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先，否则按
 	//     粘性 key 进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID），
 	//     无 user 消息时退化成本请求级随机——轮转内捕获一次即共享；
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
-	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
+	convID := session.ResolveConversationID(body)
+	if convID == "" {
+		convID = sessKey
+	}
+	if convID == "" {
+		// 第三层兜底：只发 user_id 的客户端（ExtractKey 的派生闸令 sessKey 恒空）
+		// 在此拿到内容派生的稳定会话键。
+		convID = session.CacheConversationKey(body)
+	}
+	// 整形为官方合法形状后再出站：头与 body 用的是同一个值
+	// （upstream.ChatMeta.ConversationID 的两处消费点）。
+	chatMeta := upstream.ChatMeta{ConversationID: session.SanitizeConversationID(convID)}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
 	} else if turnKey != "" && sessKey != "" {
